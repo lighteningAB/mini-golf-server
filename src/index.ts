@@ -122,10 +122,12 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 // Not Found
 // ----------------------------------------------------------------------------#
 app.notFound((c) => {
-  const accept = c.req.header("accept") ?? "";
-  if (accept.includes("text/html")) {
-    return c.html(landingHtml, 404);
-  }
+  try {
+    const accept = c.req.raw.headers?.get?.("accept") ?? c.req.query("format") ?? "";
+    if (accept.includes("text/html")) {
+      return c.html(landingHtml, 404);
+    }
+  } catch {}
   return c.json({ error: "not found" }, 404);
 });
 
