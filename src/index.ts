@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { html } from "hono/html";
-import { handle } from "hono/vercel";
 
 import { apiKeyAuth } from "./lib/auth.js";
 import { createDb } from "./lib/db.js";
@@ -133,6 +132,6 @@ app.notFound((c) => {
 });
 
 // ----------------------------------------------------------------------------#
-// Vercel Handler
+// Export
 // ----------------------------------------------------------------------------#
-export default handle(app);
+export default app;
