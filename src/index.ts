@@ -20,6 +20,7 @@ const landingHtml = html`<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Mini Golf — Daily Challenge</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛳</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap" rel="stylesheet" />
   <style>
@@ -101,7 +102,9 @@ app.use("*", async (c, next) => {
 });
 
 // Landing page — no auth required
-app.get("/", (c) => c.html(landingHtml));
+const serveLanding = (c: any) => c.html(landingHtml);
+app.get("/", serveLanding);
+app.on("GET", ["/api", "/api/"], serveLanding);
 
 // Cron endpoint uses its own auth (Bearer CRON_SECRET)
 app.route("/cron", cronRouter);
@@ -122,12 +125,10 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 // Not Found
 // ----------------------------------------------------------------------------#
 app.notFound((c) => {
-  try {
-    const accept = c.req.raw.headers?.get?.("accept") ?? c.req.query("format") ?? "";
-    if (accept.includes("text/html")) {
-      return c.html(landingHtml, 404);
-    }
-  } catch {}
+  const path = c.req.path;
+  if (path === "/" || path === "" || path === "/api" || path === "/api/") {
+    return c.html(landingHtml);
+  }
   return c.json({ error: "not found" }, 404);
 });
 
