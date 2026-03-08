@@ -21,7 +21,7 @@ const app = new Hono<Env>().basePath("/api");
 app.use("*", cors());
 
 app.use("*", async (c, next) => {
-  const db = createDb(process.env.POSTGRES_URL!);
+  const db = createDb(process.env.STORAGE_POSTGRES_URL ?? process.env.POSTGRES_URL!);
   c.set("db", db);
   await next();
 });
