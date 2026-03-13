@@ -232,7 +232,7 @@ function reducer(state: State, action: Action): State {
 }
 
 const initialState: State = {
-  screen: 'loading',
+  screen: 'onboarding',
   userId: null,
   displayName: '',
   challenge: null,
@@ -297,8 +297,7 @@ async function hmacSign(body: string): Promise<{ signature: string; timestamp: s
   return { signature: bytesToHex(new Uint8Array(mac)), timestamp };
 }
 
-async function submitScore(body: object): Promise<SubmitResult> {
-  const challengeId = todayUTC();
+async function submitScore(challengeId: string, body: object): Promise<SubmitResult> {
   const jsonBody = JSON.stringify(body);
   const { signature, timestamp } = await hmacSign(jsonBody);
   const res = await fetch(`${API_BASE}/challenge/${challengeId}/submit`, {
@@ -317,13 +316,15 @@ async function submitScore(body: object): Promise<SubmitResult> {
   return res.json();
 }
 
-async function fetchLeaderboard(challengeId: string): Promise<LeaderboardEntry[]> {
-  const res = await fetch(`${API_BASE}/leaderboard/challenge/${challengeId}?limit=50`, {
+async function fetchLeaderboard(challengeId: string, userId?: string): Promise<{ entries: LeaderboardEntry[]; yourRank: number | null }> {
+  const params = new URLSearchParams({ limit: '50' });
+  if (userId) params.set('user_id', userId);
+  const res = await fetch(`${API_BASE}/leaderboard/challenge/${challengeId}?${params}`, {
     headers: HEADERS,
   });
-  if (!res.ok) return [];
+  if (!res.ok) return { entries: [], yourRank: null };
   const data = await res.json();
-  return data.entries ?? [];
+  return { entries: data.entries ?? [], yourRank: data.your_rank ?? null };
 }
 
 async function fetchStats(userId: string): Promise<UserStats | null> {
@@ -480,17 +481,20 @@ export default function App() {
       }
 
       if (!userId) {
-        dispatch({ type: 'SET_SCREEN', screen: 'onboarding' });
+        // Already on onboarding (initial state) — nothing to do
         return;
       }
 
       dispatch({ type: 'SET_USER', userId, displayName });
+      dispatch({ type: 'SET_SCREEN', screen: 'loading' });
 
       try {
         const pending = await AsyncStorage.getItem(STORAGE_KEYS.pending);
         if (pending) {
           try {
-            await submitScore(JSON.parse(pending));
+            const parsed = JSON.parse(pending);
+            const { challenge_id: pendingChallengeId, ...pendingBody } = parsed;
+            await submitScore(pendingChallengeId ?? todayUTC(), pendingBody);
             await AsyncStorage.removeItem(STORAGE_KEYS.pending);
           } catch {}
         }
@@ -499,7 +503,14 @@ export default function App() {
         if (savedGame) {
           const gp: GameProgress = JSON.parse(savedGame);
           if (gp.challenge_id === todayUTC() && gp.completed) {
-            dispatch({ type: 'SET_SCREEN', screen: 'results' });
+            const { entries: lb, yourRank } = await fetchLeaderboard(gp.challenge_id, userId ?? undefined).catch(() => ({ entries: [] as LeaderboardEntry[], yourRank: null }));
+            const stats = userId ? await fetchStats(userId).catch(() => null) : null;
+            dispatch({
+              type: 'SET_RESULT',
+              result: { accepted: true, strokes: gp.strokes, par: 0, rank: yourRank ?? 0, total_players: lb.length, display_name_censored: null },
+              leaderboard: lb,
+              stats,
+            });
             return;
           }
         }
@@ -638,6 +649,7 @@ export default function App() {
 
     dispatch({ type: 'SET_SCREEN', screen: 'submitting' });
 
+    const challengeId = s.challenge.challenge_id;
     const body = {
       user_id: s.userId,
       display_name: s.displayName || null,
@@ -647,9 +659,14 @@ export default function App() {
     };
 
     try {
-      const result = await submitScore(body);
-      await AsyncStorage.removeItem(STORAGE_KEYS.pending);
-      const lb = await fetchLeaderboard(s.challenge.challenge_id);
+      const result = await submitScore(challengeId, body);
+      AsyncStorage.removeItem(STORAGE_KEYS.pending).catch(() => {});
+      // Update local display name to match censored server version
+      if (result.display_name_censored) {
+        dispatch({ type: 'SET_USER', userId: s.userId, displayName: result.display_name_censored });
+        AsyncStorage.setItem(STORAGE_KEYS.displayName, result.display_name_censored).catch(() => {});
+      }
+      const { entries: lb } = await fetchLeaderboard(s.challenge.challenge_id, s.userId);
       const stats = await fetchStats(s.userId);
       dispatch({ type: 'SET_RESULT', result, leaderboard: lb, stats });
 
@@ -660,12 +677,12 @@ export default function App() {
         completed: true,
         stroke_history: s.strokeHistory,
       };
-      await AsyncStorage.setItem(STORAGE_KEYS.gameState, JSON.stringify(gp));
+      AsyncStorage.setItem(STORAGE_KEYS.gameState, JSON.stringify(gp)).catch(() => {});
     } catch (err) {
       console.error('Submit failed:', err);
-      await AsyncStorage.setItem(STORAGE_KEYS.pending, JSON.stringify(body)).catch(() => {});
+      await AsyncStorage.setItem(STORAGE_KEYS.pending, JSON.stringify({ challenge_id: challengeId, ...body })).catch(() => {});
       // Still try to fetch leaderboard even if submit failed
-      const lb = await fetchLeaderboard(s.challenge.challenge_id).catch(() => [] as LeaderboardEntry[]);
+      const { entries: lb } = await fetchLeaderboard(s.challenge.challenge_id, s.userId).catch(() => ({ entries: [] as LeaderboardEntry[], yourRank: null }));
       dispatch({
         type: 'SET_RESULT',
         result: { accepted: false, strokes: s.strokes, par: s.challenge.par, rank: 0, total_players: 0, display_name_censored: null },
@@ -715,14 +732,20 @@ export default function App() {
   const handleOnboarding = async () => {
     const userId = uuid();
     const name = state.displayName.trim() || `anon_${userId.slice(0, 4)}`;
-    await AsyncStorage.setItem(STORAGE_KEYS.userId, userId);
-    await AsyncStorage.setItem(STORAGE_KEYS.displayName, name);
     dispatch({ type: 'SET_USER', userId, displayName: name });
     dispatch({ type: 'SET_SCREEN', screen: 'loading' });
 
+    // Persist — but don't block on failure
+    try {
+      await AsyncStorage.setItem(STORAGE_KEYS.userId, userId);
+      await AsyncStorage.setItem(STORAGE_KEYS.displayName, name);
+    } catch {
+      console.warn('Could not persist user to AsyncStorage');
+    }
+
     try {
       const challenge = await fetchChallenge();
-      await AsyncStorage.setItem(STORAGE_KEYS.challenge, JSON.stringify(challenge));
+      AsyncStorage.setItem(STORAGE_KEYS.challenge, JSON.stringify(challenge)).catch(() => {});
       dispatch({ type: 'SET_CHALLENGE', challenge });
     } catch {
       dispatch({ type: 'SET_ERROR', error: 'Connect to play today\'s course' });
@@ -941,7 +964,8 @@ export default function App() {
           </View>
           <ScrollView style={styles.leaderboard} showsVerticalScrollIndicator={false}>
             {state.leaderboard.length > 0 ? state.leaderboard.map((entry) => {
-              const isYou = state.displayName && entry.display_name === state.displayName;
+              const isYou = !!(state.displayName && entry.display_name &&
+                entry.display_name.toLowerCase() === state.displayName.toLowerCase());
               return (
                 <View key={entry.rank} style={[styles.lbRow, isYou && styles.lbRowYou]}>
                   <Text style={[styles.lbRank, entry.rank <= 3 && { color: tokens.colors.red }]}>
