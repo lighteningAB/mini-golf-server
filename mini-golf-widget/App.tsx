@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   PanResponder,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -309,12 +310,15 @@ async function submitScore(body: object): Promise<SubmitResult> {
     },
     body: jsonBody,
   });
-  if (!res.ok) throw new Error(`Submit error: ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Submit error ${res.status}: ${text}`);
+  }
   return res.json();
 }
 
 async function fetchLeaderboard(challengeId: string): Promise<LeaderboardEntry[]> {
-  const res = await fetch(`${API_BASE}/leaderboard/challenge/${challengeId}?limit=10`, {
+  const res = await fetch(`${API_BASE}/leaderboard/challenge/${challengeId}?limit=50`, {
     headers: HEADERS,
   });
   if (!res.ok) return [];
@@ -466,8 +470,14 @@ export default function App() {
   // ---- Init ----------------------------------------------------------------
   useEffect(() => {
     (async () => {
-      let userId = await AsyncStorage.getItem(STORAGE_KEYS.userId);
-      let displayName = (await AsyncStorage.getItem(STORAGE_KEYS.displayName)) ?? '';
+      let userId: string | null = null;
+      let displayName = '';
+      try {
+        userId = await AsyncStorage.getItem(STORAGE_KEYS.userId);
+        displayName = (await AsyncStorage.getItem(STORAGE_KEYS.displayName)) ?? '';
+      } catch {
+        // AsyncStorage unavailable — fall through to onboarding
+      }
 
       if (!userId) {
         dispatch({ type: 'SET_SCREEN', screen: 'onboarding' });
@@ -476,33 +486,37 @@ export default function App() {
 
       dispatch({ type: 'SET_USER', userId, displayName });
 
-      const pending = await AsyncStorage.getItem(STORAGE_KEYS.pending);
-      if (pending) {
-        try {
-          await submitScore(JSON.parse(pending));
-          await AsyncStorage.removeItem(STORAGE_KEYS.pending);
-        } catch {}
-      }
-
-      const savedGame = await AsyncStorage.getItem(STORAGE_KEYS.gameState);
-      if (savedGame) {
-        const gp: GameProgress = JSON.parse(savedGame);
-        if (gp.challenge_id === todayUTC() && gp.completed) {
-          dispatch({ type: 'SET_SCREEN', screen: 'results' });
-          return;
+      try {
+        const pending = await AsyncStorage.getItem(STORAGE_KEYS.pending);
+        if (pending) {
+          try {
+            await submitScore(JSON.parse(pending));
+            await AsyncStorage.removeItem(STORAGE_KEYS.pending);
+          } catch {}
         }
-      }
+
+        const savedGame = await AsyncStorage.getItem(STORAGE_KEYS.gameState);
+        if (savedGame) {
+          const gp: GameProgress = JSON.parse(savedGame);
+          if (gp.challenge_id === todayUTC() && gp.completed) {
+            dispatch({ type: 'SET_SCREEN', screen: 'results' });
+            return;
+          }
+        }
+      } catch {}
 
       try {
         const challenge = await fetchChallenge();
         dispatch({ type: 'SET_CHALLENGE', challenge });
       } catch {
-        const cached = await AsyncStorage.getItem(STORAGE_KEYS.challenge);
-        if (cached) {
-          dispatch({ type: 'SET_CHALLENGE', challenge: JSON.parse(cached) });
-        } else {
-          dispatch({ type: 'SET_ERROR', error: 'Connect to play today\'s course' });
-        }
+        try {
+          const cached = await AsyncStorage.getItem(STORAGE_KEYS.challenge);
+          if (cached) {
+            dispatch({ type: 'SET_CHALLENGE', challenge: JSON.parse(cached) });
+            return;
+          }
+        } catch {}
+        dispatch({ type: 'SET_ERROR', error: 'Connect to play today\'s course' });
       }
     })();
   }, []);
@@ -647,9 +661,17 @@ export default function App() {
         stroke_history: s.strokeHistory,
       };
       await AsyncStorage.setItem(STORAGE_KEYS.gameState, JSON.stringify(gp));
-    } catch {
-      await AsyncStorage.setItem(STORAGE_KEYS.pending, JSON.stringify(body));
-      dispatch({ type: 'SET_RESULT', result: { accepted: false, strokes: s.strokes, par: s.challenge.par, rank: 0, total_players: 0, display_name_censored: null }, leaderboard: [], stats: null });
+    } catch (err) {
+      console.error('Submit failed:', err);
+      await AsyncStorage.setItem(STORAGE_KEYS.pending, JSON.stringify(body)).catch(() => {});
+      // Still try to fetch leaderboard even if submit failed
+      const lb = await fetchLeaderboard(s.challenge.challenge_id).catch(() => [] as LeaderboardEntry[]);
+      dispatch({
+        type: 'SET_RESULT',
+        result: { accepted: false, strokes: s.strokes, par: s.challenge.par, rank: 0, total_players: 0, display_name_censored: null },
+        leaderboard: lb,
+        stats: null,
+      });
     }
   };
 
@@ -846,6 +868,18 @@ export default function App() {
             {/* Floating HUD overlay */}
             <View style={styles.hudOverlay}>
               <View style={styles.hud}>
+                {state.submitResult && (
+                  <>
+                    <TouchableOpacity
+                      activeOpacity={0.6}
+                      onPress={() => dispatch({ type: 'SET_SCREEN', screen: 'results' })}
+                      style={styles.hudBackBtn}
+                    >
+                      <Text style={styles.hudBackBtnText}>{'◀'}</Text>
+                    </TouchableOpacity>
+                    <View style={styles.hudDivider} />
+                  </>
+                )}
                 <View style={styles.hudItem}>
                   <Text style={styles.hudLabel}>STROKES</Text>
                   <Text style={styles.hudValue}>{state.strokes}</Text>
@@ -875,68 +909,56 @@ export default function App() {
 
       {state.screen === 'results' && (
         <View style={styles.resultsContainer}>
-          <Text style={styles.resultsStrokeCount}>
-            {state.submitResult?.strokes ?? state.strokes}
-          </Text>
-          <Text style={styles.resultsStrokeLabel}>STROKES</Text>
-
-          {state.submitResult && (
+          {/* Header: your score + stats row */}
+          <View style={styles.resultsHeader}>
             <View style={styles.resultsMeta}>
               <View style={styles.resultsStat}>
-                <Text style={styles.resultStatValue}>{state.submitResult.par}</Text>
+                <Text style={styles.resultStatValue}>{state.submitResult?.strokes ?? state.strokes}</Text>
+                <Text style={styles.resultStatLabel}>STROKES</Text>
+              </View>
+              <View style={styles.resultsDivider} />
+              <View style={styles.resultsStat}>
+                <Text style={styles.resultStatValue}>{state.submitResult?.par ?? state.challenge?.par ?? '-'}</Text>
                 <Text style={styles.resultStatLabel}>PAR</Text>
               </View>
-              <View style={styles.resultsDivider} />
-              <View style={styles.resultsStat}>
-                <Text style={[styles.resultStatValue, state.submitResult.rank <= 3 && { color: tokens.colors.red }]}>
-                  #{state.submitResult.rank}
-                </Text>
-                <Text style={styles.resultStatLabel}>RANK</Text>
-              </View>
-              <View style={styles.resultsDivider} />
-              <View style={styles.resultsStat}>
-                <Text style={styles.resultStatValue}>{state.submitResult.total_players}</Text>
-                <Text style={styles.resultStatLabel}>PLAYERS</Text>
-              </View>
-            </View>
-          )}
-
-          {state.leaderboard.length > 0 && (
-            <View style={styles.leaderboard}>
-              {state.leaderboard.slice(0, 5).map((entry) => {
-                const isYou = state.displayName && entry.display_name === state.displayName;
-                return (
-                  <View key={entry.rank} style={[styles.lbRow, isYou && styles.lbRowYou]}>
-                    <Text style={[styles.lbRank, entry.rank <= 3 && { color: tokens.colors.red }]}>
-                      {entry.rank}
+              {state.submitResult && state.submitResult.rank > 0 && (
+                <>
+                  <View style={styles.resultsDivider} />
+                  <View style={styles.resultsStat}>
+                    <Text style={[styles.resultStatValue, state.submitResult.rank <= 3 && { color: tokens.colors.red }]}>
+                      #{state.submitResult.rank}
                     </Text>
-                    <Text style={styles.lbName} numberOfLines={1}>
-                      {isYou ? 'YOU' : entry.display_name}
-                    </Text>
-                    <Text style={styles.lbScore}>{entry.strokes}</Text>
+                    <Text style={styles.resultStatLabel}>RANK</Text>
                   </View>
-                );
-              })}
+                </>
+              )}
             </View>
-          )}
+          </View>
 
-          {state.stats && (
-            <View style={styles.statsRow}>
-              <View style={styles.miniStat}>
-                <Text style={styles.miniStatValue}>{state.stats.games_played}</Text>
-                <Text style={styles.miniStatLabel}>PLAYED</Text>
-              </View>
-              <View style={styles.miniStat}>
-                <Text style={styles.miniStatValue}>{state.stats.current_streak}</Text>
-                <Text style={styles.miniStatLabel}>STREAK</Text>
-              </View>
-              <View style={styles.miniStat}>
-                <Text style={styles.miniStatValue}>{state.stats.best_round ?? '-'}</Text>
-                <Text style={styles.miniStatLabel}>BEST</Text>
-              </View>
-            </View>
-          )}
+          {/* Scrollable leaderboard */}
+          <View style={styles.lbHeader}>
+            <Text style={styles.lbHeaderText}>LEADERBOARD</Text>
+          </View>
+          <ScrollView style={styles.leaderboard} showsVerticalScrollIndicator={false}>
+            {state.leaderboard.length > 0 ? state.leaderboard.map((entry) => {
+              const isYou = state.displayName && entry.display_name === state.displayName;
+              return (
+                <View key={entry.rank} style={[styles.lbRow, isYou && styles.lbRowYou]}>
+                  <Text style={[styles.lbRank, entry.rank <= 3 && { color: tokens.colors.red }]}>
+                    {entry.rank}
+                  </Text>
+                  <Text style={styles.lbName} numberOfLines={1}>
+                    {isYou ? 'YOU' : entry.display_name}
+                  </Text>
+                  <Text style={styles.lbScore}>{entry.strokes}</Text>
+                </View>
+              );
+            }) : (
+              <Text style={styles.lbEmpty}>No scores yet</Text>
+            )}
+          </ScrollView>
 
+          {/* Replay button */}
           <TouchableOpacity
             activeOpacity={0.6}
             style={styles.replayBtn}
@@ -1113,6 +1135,15 @@ const styles = StyleSheet.create({
     color: tokens.colors.light,
     textTransform: 'uppercase',
   },
+  hudBackBtn: {
+    paddingHorizontal: 2,
+    paddingVertical: 2,
+  },
+  hudBackBtnText: {
+    fontSize: 8,
+    color: tokens.colors.light,
+    opacity: 0.7,
+  },
   hudDivider: {
     width: 1,
     height: 16,
@@ -1139,39 +1170,26 @@ const styles = StyleSheet.create({
   // --- Results ---
   resultsContainer: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
     paddingHorizontal: 6,
+    paddingTop: 8,
+    paddingBottom: 4,
   },
-  resultsStrokeCount: {
-    fontFamily: 'ndot',
-    fontSize: 24,
-    lineHeight: 26,
-    color: tokens.colors.light,
-    textTransform: 'uppercase',
-  },
-  resultsStrokeLabel: {
-    fontFamily: 'Inter',
-    fontSize: 8,
-    fontWeight: '500',
-    color: tokens.colors['secondary-light'],
-    textTransform: 'uppercase',
-    letterSpacing: 1,
+  resultsHeader: {
+    alignItems: 'center',
     marginBottom: 4,
   },
   resultsMeta: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    marginBottom: 4,
+    gap: 8,
   },
   resultsStat: {
     alignItems: 'center',
   },
   resultStatValue: {
     fontFamily: 'ndot',
-    fontSize: 9,
-    lineHeight: 10,
+    fontSize: 12,
+    lineHeight: 13,
     color: tokens.colors.light,
     textTransform: 'uppercase',
   },
@@ -1186,32 +1204,45 @@ const styles = StyleSheet.create({
   },
   resultsDivider: {
     width: 1,
-    height: 12,
+    height: 14,
     backgroundColor: tokens.colors['secondary-dark'],
     opacity: 0.4,
   },
 
   // Leaderboard
+  lbHeader: {
+    paddingHorizontal: 3,
+    marginBottom: 2,
+  },
+  lbHeaderText: {
+    fontFamily: 'Inter',
+    fontSize: 7,
+    fontWeight: '700',
+    color: tokens.colors['secondary-light'],
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
   leaderboard: {
+    flex: 1,
     width: '100%',
-    marginBottom: 3,
+    marginBottom: 4,
   },
   lbRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 1.5,
+    paddingVertical: 2,
     paddingHorizontal: 3,
-    borderRadius: 2,
+    borderRadius: 3,
   },
   lbRowYou: {
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    backgroundColor: 'rgba(255,255,255,0.08)',
   },
   lbRank: {
     fontFamily: 'Inter',
     fontSize: 8,
     fontWeight: '500',
     color: tokens.colors['secondary-light'],
-    width: 12,
+    width: 14,
     textAlign: 'right',
     marginRight: 4,
   },
@@ -1230,42 +1261,19 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     marginLeft: 4,
   },
-
-  // Personal stats
-  statsRow: {
-    flexDirection: 'row',
-    gap: 10,
-    marginBottom: 3,
-    borderTopWidth: 1,
-    borderTopColor: tokens.colors['secondary-dark'],
-    paddingTop: 3,
-    width: '100%',
-    justifyContent: 'center',
-  },
-  miniStat: {
-    alignItems: 'center',
-  },
-  miniStatValue: {
-    fontFamily: 'ndot',
-    fontSize: 8,
-    lineHeight: 9,
-    color: tokens.colors.light,
-    textTransform: 'uppercase',
-  },
-  miniStatLabel: {
+  lbEmpty: {
     fontFamily: 'Inter',
-    fontSize: 7,
-    fontWeight: '500',
-    color: tokens.colors['secondary-light'],
-    textTransform: 'uppercase',
-    letterSpacing: 0.3,
-    marginTop: 1,
+    fontSize: 8,
+    fontWeight: '400',
+    color: tokens.colors['secondary-dark'],
+    textAlign: 'center',
+    marginTop: 8,
   },
 
   replayBtn: {
-    marginTop: 6,
     paddingHorizontal: 16,
     paddingVertical: 5,
+    marginHorizontal: 10,
     borderWidth: 1,
     borderColor: tokens.colors.light,
     borderRadius: 6,
