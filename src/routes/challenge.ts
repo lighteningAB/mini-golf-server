@@ -6,6 +6,7 @@ import { challenges, submissions, users } from "../db/schema.js";
 import type { Course } from "../db/schema.js";
 import { computePar, generateCourse } from "../lib/course-generator.js";
 import { censorName } from "../lib/profanity.js";
+import { hmacAuth } from "../lib/hmac.js";
 import { validateStrokeHistory } from "../lib/validator.js";
 import type { Env } from "./types.js";
 
@@ -51,7 +52,7 @@ challengeRouter.get("/today", async (c) => {
   });
 });
 
-challengeRouter.post("/:id/submit", async (c) => {
+challengeRouter.post("/:id/submit", hmacAuth(), async (c) => {
   const db = c.get("db");
   const challengeId = c.req.param("id");
   const body = await c.req.json();
@@ -77,11 +78,12 @@ challengeRouter.post("/:id/submit", async (c) => {
 
   const course = challenge.course as Course;
 
-  if (stroke_history) {
-    const validation = validateStrokeHistory(course, strokes, completed, stroke_history);
-    if (!validation.valid) {
-      return c.json({ error: validation.reason }, 400);
-    }
+  if (!stroke_history) {
+    return c.json({ error: "stroke_history is required" }, 400);
+  }
+  const validation = validateStrokeHistory(course, strokes, completed, stroke_history);
+  if (!validation.valid) {
+    return c.json({ error: validation.reason }, 400);
   }
 
   const censored = display_name ? censorName(display_name) : null;

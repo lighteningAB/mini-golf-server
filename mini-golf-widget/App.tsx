@@ -1,6 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
-  Dimensions,
   PanResponder,
   StyleSheet,
   Text,
@@ -9,7 +8,7 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Svg, { Circle, Defs, Line, Pattern, Rect } from 'react-native-svg';
+import Svg, { Circle, Defs, Line, Pattern, Polygon, Rect } from 'react-native-svg';
 import { tokens } from './src/styles/tokens';
 
 // ----------------------------------------------------------------------------#
@@ -17,7 +16,8 @@ import { tokens } from './src/styles/tokens';
 // ----------------------------------------------------------------------------#
 const API_BASE = 'https://mini-golf-server.vercel.app/api';
 const API_KEY = 'gk_replace_me';
-const HEADERS = { 'x-api-key': API_KEY, 'Content-Type': 'application/json' };
+const HMAC_SECRET = '310ff372388952444c41410e88993f55aebd6dd0392c75e28501343bd68fca98';
+const HEADERS: Record<string, string> = { 'x-api-key': API_KEY, 'Content-Type': 'application/json' };
 
 const STORAGE_KEYS = {
   userId: '@mg_user_id',
@@ -37,7 +37,9 @@ const SINK_THRESHOLD = 0.6;
 const BOUNCE_DAMPING = 0.7;
 const DAY_CHECK_MS = 60_000;
 
-const COURSE_BG = '#2A2A2E';
+const WIDGET_SIZE = 166;
+const VIEW_SIZE = 55;
+const COURSE_BG = '#262626';
 const GRID_DOT_COLOR = '#3A3A3E';
 
 // ----------------------------------------------------------------------------#
@@ -135,7 +137,8 @@ type Action =
   | { type: 'SINK_ANIMATE'; scale: number }
   | { type: 'SET_RESULT'; result: SubmitResult; leaderboard: LeaderboardEntry[]; stats: UserStats | null }
   | { type: 'SET_ERROR'; error: string }
-  | { type: 'RESET_FOR_NEW_DAY' };
+  | { type: 'RESET_FOR_NEW_DAY' }
+  | { type: 'REPLAY' };
 
 // ----------------------------------------------------------------------------#
 // Reducer
@@ -207,6 +210,21 @@ function reducer(state: State, action: Action): State {
         leaderboard: [],
         screen: 'loading',
       };
+    case 'REPLAY': {
+      if (!state.challenge) return state;
+      const start = state.challenge.course.start;
+      return {
+        ...state,
+        ball: { x: start.x, y: start.y, vx: 0, vy: 0 },
+        strokes: 0,
+        strokeHistory: [],
+        completed: false,
+        sinking: false,
+        sinkScale: 1,
+        isMoving: false,
+        screen: 'playing',
+      };
+    }
     default:
       return state;
   }
@@ -257,12 +275,39 @@ async function fetchChallenge(): Promise<ChallengeData> {
   return res.json();
 }
 
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function hmacSign(body: string): Promise<{ signature: string; timestamp: string }> {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signingString = `${timestamp}.${body}`;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(HMAC_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(signingString));
+  return { signature: bytesToHex(new Uint8Array(mac)), timestamp };
+}
+
 async function submitScore(body: object): Promise<SubmitResult> {
   const challengeId = todayUTC();
+  const jsonBody = JSON.stringify(body);
+  const { signature, timestamp } = await hmacSign(jsonBody);
   const res = await fetch(`${API_BASE}/challenge/${challengeId}/submit`, {
     method: 'POST',
-    headers: HEADERS,
-    body: JSON.stringify(body),
+    headers: {
+      ...HEADERS,
+      'x-hmac-signature': signature,
+      'x-hmac-timestamp': timestamp,
+    },
+    body: jsonBody,
   });
   if (!res.ok) throw new Error(`Submit error: ${res.status}`);
   return res.json();
@@ -397,10 +442,26 @@ export default function App() {
   const aimRef = useRef<{ startX: number; startY: number; curX: number; curY: number } | null>(null);
   const [, forceRender] = useReducer((c: number) => c + 1, 0);
 
-  const { width: screenW } = Dimensions.get('window');
-  const CANVAS_W = Math.min(screenW - 32, 322);
-  const CANVAS_H = Math.round(CANVAS_W * (GRID / GRID));
-  const SCALE = CANVAS_W / GRID;
+  // Hole pulse animation
+  const [pulse, setPulse] = useState(0);
+  useEffect(() => {
+    if (state.screen !== 'playing') return;
+    let frame: number;
+    let t = 0;
+    const tick = () => {
+      t += 0.04;
+      setPulse((Math.sin(t) + 1) / 2); // 0..1
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [state.screen]);
+
+  // Camera viewBox centered on ball
+  const halfView = VIEW_SIZE / 2;
+  const vbX = clamp(state.ball.x - halfView, 0, GRID - VIEW_SIZE);
+  const vbY = clamp(state.ball.y - halfView, 0, GRID - VIEW_SIZE);
+  const dynamicViewBox = `${vbX} ${vbY} ${VIEW_SIZE} ${VIEW_SIZE}`;
 
   // ---- Init ----------------------------------------------------------------
   useEffect(() => {
@@ -616,7 +677,7 @@ export default function App() {
 
         const dx = aim.startX - aim.curX;
         const dy = aim.startY - aim.curY;
-        const power = Math.min(Math.hypot(dx, dy) / (CANVAS_W * 0.3), 1);
+        const power = Math.min(Math.hypot(dx, dy) / (WIDGET_SIZE * 0.3), 1);
 
         if (power < 0.02) return;
 
@@ -626,7 +687,7 @@ export default function App() {
         startPhysics(vx, vy);
       },
     }),
-  [startPhysics, CANVAS_W]);
+  [startPhysics]);
 
   // ---- Onboarding submit ----------------------------------------------------
   const handleOnboarding = async () => {
@@ -648,16 +709,16 @@ export default function App() {
 
   // ---- Render ---------------------------------------------------------------
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, state.screen === 'playing' && { backgroundColor: COURSE_BG, borderRadius: 32 }]}>
       {state.screen === 'onboarding' && (
         <View style={styles.centeredContainer}>
-          <Text style={styles.titleText}>MINI GOLF</Text>
+          <Text style={styles.onboardingTitle}>MINI GOLF</Text>
           <View style={styles.dotRow}>
             {Array.from({ length: 8 }).map((_, i) => (
-              <View key={i} style={styles.decorDot} />
+              <View key={i} style={styles.decorDotGray} />
             ))}
           </View>
-          <Text style={styles.subtitleText}>DAILY CHALLENGE</Text>
+          <Text style={styles.onboardingSubtitle}>DAILY CHALLENGE</Text>
           <TextInput
             style={styles.nameInput}
             placeholder="ENTER NAME"
@@ -676,173 +737,153 @@ export default function App() {
 
       {state.screen === 'loading' && (
         <View style={styles.centeredContainer}>
-          <Text style={styles.titleText}>LOADING</Text>
+          <Text style={styles.loadingTitle}>LOADING</Text>
           <View style={styles.dotRow}>
             {Array.from({ length: 5 }).map((_, i) => (
-              <View key={i} style={[styles.decorDot, { opacity: 0.3 + i * 0.15 }]} />
+              <View key={i} style={[styles.decorDotRed, { opacity: 0.3 + i * 0.15 }]} />
             ))}
           </View>
+          <Text style={styles.loadingFooter}>MINI GOLF WIDGET</Text>
         </View>
       )}
 
-      {state.screen === 'playing' && state.challenge && (
-        <View style={styles.gameContainer}>
-          <View style={styles.hud}>
-            <View style={styles.hudItem}>
-              <Text style={styles.hudLabel}>STROKES</Text>
-              <Text style={styles.hudValue}>{state.strokes}</Text>
+      {state.screen === 'playing' && state.challenge && (() => {
+        const hole = state.challenge.course.hole;
+        // Arrow at bottom-center of visible viewport, pointing toward hole
+        const arrowDx = hole.x - state.ball.x;
+        const arrowDy = hole.y - state.ball.y;
+        const arrowDist = Math.hypot(arrowDx, arrowDy);
+        const arrowAngle = Math.atan2(arrowDy, arrowDx);
+        // Bottom-center of current viewBox
+        const arrowCx = vbX + VIEW_SIZE / 2;
+        const arrowCy = vbY + VIEW_SIZE - 5;
+        const arrowSize = 2.5;
+
+        const ballR = BALL_RADIUS * (state.sinking ? state.sinkScale : 1);
+
+        return (
+          <View style={{ flex: 1, borderRadius: 32, overflow: 'hidden', backgroundColor: COURSE_BG }}>
+            <View style={{ width: WIDGET_SIZE, height: WIDGET_SIZE }} {...panResponder.panHandlers}>
+              <Svg width={WIDGET_SIZE} height={WIDGET_SIZE} viewBox={dynamicViewBox}>
+                <Defs>
+                  <Pattern id="dotGrid" width="5" height="5" patternUnits="userSpaceOnUse">
+                    <Circle cx="2.5" cy="2.5" r="0.3" fill={GRID_DOT_COLOR} />
+                  </Pattern>
+                </Defs>
+
+                {/* Extended background to fill behind rounded corners */}
+                <Rect x="-20" y="-20" width={GRID + 40} height={GRID + 40} fill={COURSE_BG} />
+                <Rect x="0" y="0" width={GRID} height={GRID} fill="url(#dotGrid)" />
+
+                {state.challenge.course.walls.map((w, i) =>
+                  w.type === 'rect' ? (
+                    <Rect key={`w${i}`} x={w.x} y={w.y} width={w.w} height={w.h} fill={tokens.colors.light} opacity={0.9} />
+                  ) : null,
+                )}
+
+                {state.challenge.course.obstacles.map((o, i) =>
+                  o.type === 'rect' ? (
+                    <Rect key={`o${i}`} x={o.x} y={o.y} width={o.w} height={o.h} fill="#E5E7EB" opacity={0.9} rx="0.5" />
+                  ) : o.type === 'circle' ? (
+                    <Circle key={`o${i}`} cx={o.x} cy={o.y} r={o.radius} fill="#E5E7EB" opacity={0.9} />
+                  ) : null,
+                )}
+
+                {/* Hole - pulsing yellow glow */}
+                <Circle cx={hole.x} cy={hole.y} r={hole.radius + 2.5 + pulse * 1.5} fill="#FDE047" opacity={0.06 + pulse * 0.06} />
+                <Circle cx={hole.x} cy={hole.y} r={hole.radius + 1.2 + pulse * 0.8} fill="#FDE047" opacity={0.1 + pulse * 0.08} />
+                <Circle cx={hole.x} cy={hole.y} r={hole.radius} fill="#1a1a1a" stroke="#FDE047" strokeWidth={0.4 + pulse * 0.3} opacity={0.7 + pulse * 0.3} />
+                <Circle cx={hole.x} cy={hole.y} r={hole.radius * 0.4} fill="#292524" />
+
+                {/* Aim line */}
+                {aimRef.current && !state.isMoving && (() => {
+                  const aim = aimRef.current!;
+                  const dx = aim.startX - aim.curX;
+                  const dy = aim.startY - aim.curY;
+                  const len = Math.hypot(dx, dy);
+                  if (len < 3) return null;
+                  const nx = dx / len;
+                  const ny = dy / len;
+                  const power = Math.min(len / (WIDGET_SIZE * 0.3), 1);
+                  const lineLen = power * 25;
+                  return (
+                    <Line x1={state.ball.x} y1={state.ball.y} x2={state.ball.x + nx * lineLen} y2={state.ball.y + ny * lineLen} stroke={tokens.colors.red} strokeWidth="0.8" strokeDasharray="1.5,1" opacity={0.8} />
+                  );
+                })()}
+
+                {/* Ball glow + ball */}
+                {!state.completed && (
+                  <>
+                    <Circle cx={state.ball.x} cy={state.ball.y} r={ballR * 3.5} fill="#EF4444" opacity={0.08} />
+                    <Circle cx={state.ball.x} cy={state.ball.y} r={ballR * 2.2} fill="#EF4444" opacity={0.15} />
+                    <Circle cx={state.ball.x} cy={state.ball.y} r={ballR * 1.4} fill="#EF4444" opacity={0.3} />
+                    <Circle cx={state.ball.x} cy={state.ball.y} r={ballR} fill="#EF4444" />
+                    <Circle cx={state.ball.x - ballR * 0.3} cy={state.ball.y - ballR * 0.3} r={ballR * 0.35} fill="#FCA5A5" opacity={0.6} />
+                  </>
+                )}
+                {state.sinking && state.sinkScale > 0 && (
+                  <>
+                    <Circle cx={hole.x} cy={hole.y} r={BALL_RADIUS * state.sinkScale * 2.2} fill="#EF4444" opacity={0.15} />
+                    <Circle cx={hole.x} cy={hole.y} r={BALL_RADIUS * state.sinkScale} fill="#EF4444" />
+                  </>
+                )}
+
+                {/* Direction arrow toward hole - bottom center of screen */}
+                {arrowDist > hole.radius + 2 && !state.completed && (
+                  <>
+                    <Circle cx={arrowCx} cy={arrowCy} r={arrowSize * 1.8} fill="#FDE047" opacity={0.1} />
+                    <Circle cx={arrowCx} cy={arrowCy} r={arrowSize * 1.2} fill="#FDE047" opacity={0.15} />
+                    <Polygon
+                      points={`${arrowCx + Math.cos(arrowAngle) * arrowSize},${arrowCy + Math.sin(arrowAngle) * arrowSize} ${arrowCx + Math.cos(arrowAngle + 2.4) * arrowSize * 0.7},${arrowCy + Math.sin(arrowAngle + 2.4) * arrowSize * 0.7} ${arrowCx + Math.cos(arrowAngle - 2.4) * arrowSize * 0.7},${arrowCy + Math.sin(arrowAngle - 2.4) * arrowSize * 0.7}`}
+                      fill="#FDE047"
+                      opacity={0.85}
+                    />
+                  </>
+                )}
+              </Svg>
             </View>
-            <View style={styles.hudDivider} />
-            <View style={styles.hudItem}>
-              <Text style={styles.hudLabel}>PAR</Text>
-              <Text style={styles.hudValue}>{state.challenge.par}</Text>
+
+            {/* Floating HUD overlay */}
+            <View style={styles.hudOverlay}>
+              <View style={styles.hud}>
+                <View style={styles.hudItem}>
+                  <Text style={styles.hudLabel}>STROKES</Text>
+                  <Text style={styles.hudValue}>{state.strokes}</Text>
+                </View>
+                <View style={styles.hudDivider} />
+                <View style={styles.hudItem}>
+                  <Text style={styles.hudLabel}>PAR</Text>
+                  <Text style={styles.hudValue}>{state.challenge.par}</Text>
+                </View>
+              </View>
             </View>
           </View>
-
-          <View style={{ width: CANVAS_W, height: CANVAS_H }} {...panResponder.panHandlers}>
-            <Svg width={CANVAS_W} height={CANVAS_H} viewBox={`0 0 ${GRID} ${GRID}`}>
-              <Defs>
-                <Pattern id="dotGrid" width="5" height="5" patternUnits="userSpaceOnUse">
-                  <Circle cx="2.5" cy="2.5" r="0.3" fill={GRID_DOT_COLOR} />
-                </Pattern>
-              </Defs>
-
-              {/* Course background */}
-              <Rect x="0" y="0" width={GRID} height={GRID} fill={COURSE_BG} rx="1" />
-              <Rect x="0" y="0" width={GRID} height={GRID} fill="url(#dotGrid)" />
-
-              {/* Walls */}
-              {state.challenge.course.walls.map((w, i) =>
-                w.type === 'rect' ? (
-                  <Rect
-                    key={`w${i}`}
-                    x={w.x}
-                    y={w.y}
-                    width={w.w}
-                    height={w.h}
-                    fill={tokens.colors.light}
-                    opacity={0.9}
-                  />
-                ) : null,
-              )}
-
-              {/* Obstacles */}
-              {state.challenge.course.obstacles.map((o, i) =>
-                o.type === 'rect' ? (
-                  <Rect
-                    key={`o${i}`}
-                    x={o.x}
-                    y={o.y}
-                    width={o.w}
-                    height={o.h}
-                    fill={tokens.colors.light}
-                    opacity={0.7}
-                    rx="0.5"
-                  />
-                ) : o.type === 'circle' ? (
-                  <Circle
-                    key={`o${i}`}
-                    cx={o.x}
-                    cy={o.y}
-                    r={o.radius}
-                    fill="none"
-                    stroke={tokens.colors.light}
-                    strokeWidth="0.8"
-                    opacity={0.7}
-                  />
-                ) : null,
-              )}
-
-              {/* Hole */}
-              <Circle
-                cx={state.challenge.course.hole.x}
-                cy={state.challenge.course.hole.y}
-                r={state.challenge.course.hole.radius + 0.8}
-                fill={tokens.colors['secondary-light']}
-                opacity={0.3}
-              />
-              <Circle
-                cx={state.challenge.course.hole.x}
-                cy={state.challenge.course.hole.y}
-                r={state.challenge.course.hole.radius}
-                fill={tokens.colors.dark}
-                stroke={tokens.colors['secondary-light']}
-                strokeWidth="0.5"
-              />
-
-              {/* Aim line */}
-              {aimRef.current && !state.isMoving && (() => {
-                const aim = aimRef.current!;
-                const dx = aim.startX - aim.curX;
-                const dy = aim.startY - aim.curY;
-                const len = Math.hypot(dx, dy);
-                if (len < 3) return null;
-                const nx = dx / len;
-                const ny = dy / len;
-                const power = Math.min(len / (CANVAS_W * 0.3), 1);
-                const lineLen = power * 25;
-                return (
-                  <Line
-                    x1={state.ball.x}
-                    y1={state.ball.y}
-                    x2={state.ball.x + nx * lineLen}
-                    y2={state.ball.y + ny * lineLen}
-                    stroke={tokens.colors.red}
-                    strokeWidth="0.8"
-                    strokeDasharray="1.5,1"
-                    opacity={0.8}
-                  />
-                );
-              })()}
-
-              {/* Ball */}
-              {!state.completed && (
-                <Circle
-                  cx={state.ball.x}
-                  cy={state.ball.y}
-                  r={BALL_RADIUS * (state.sinking ? state.sinkScale : 1)}
-                  fill={tokens.colors.red}
-                />
-              )}
-              {state.sinking && state.sinkScale > 0 && (
-                <Circle
-                  cx={state.challenge.course.hole.x}
-                  cy={state.challenge.course.hole.y}
-                  r={BALL_RADIUS * state.sinkScale}
-                  fill={tokens.colors.red}
-                />
-              )}
-            </Svg>
-          </View>
-        </View>
-      )}
+        );
+      })()}
 
       {state.screen === 'submitting' && (
         <View style={styles.centeredContainer}>
-          <Text style={styles.titleText}>SUBMITTING</Text>
+          <Text style={styles.submittingTitle}>SUBMITTING</Text>
           <View style={styles.dotRow}>
             {Array.from({ length: 3 }).map((_, i) => (
-              <View key={i} style={styles.decorDot} />
+              <View key={i} style={styles.decorDotRed} />
             ))}
           </View>
+          <Text style={styles.submittingStatus}>SYNCING...</Text>
         </View>
       )}
 
       {state.screen === 'results' && (
         <View style={styles.resultsContainer}>
-          <View style={styles.resultsHeader}>
-            <Text style={styles.titleText}>
-              {state.submitResult?.strokes ?? state.strokes}
-            </Text>
-            <Text style={styles.hudLabel}>STROKES</Text>
-          </View>
+          <Text style={styles.resultsStrokeCount}>
+            {state.submitResult?.strokes ?? state.strokes}
+          </Text>
+          <Text style={styles.resultsStrokeLabel}>STROKES</Text>
 
           {state.submitResult && (
             <View style={styles.resultsMeta}>
               <View style={styles.resultsStat}>
-                <Text style={styles.resultStatValue}>
-                  {state.submitResult.par}
-                </Text>
+                <Text style={styles.resultStatValue}>{state.submitResult.par}</Text>
                 <Text style={styles.resultStatLabel}>PAR</Text>
               </View>
               <View style={styles.resultsDivider} />
@@ -854,9 +895,7 @@ export default function App() {
               </View>
               <View style={styles.resultsDivider} />
               <View style={styles.resultsStat}>
-                <Text style={styles.resultStatValue}>
-                  {state.submitResult.total_players}
-                </Text>
+                <Text style={styles.resultStatValue}>{state.submitResult.total_players}</Text>
                 <Text style={styles.resultStatLabel}>PLAYERS</Text>
               </View>
             </View>
@@ -864,18 +903,20 @@ export default function App() {
 
           {state.leaderboard.length > 0 && (
             <View style={styles.leaderboard}>
-              <Text style={styles.lbTitle}>LEADERBOARD</Text>
-              {state.leaderboard.slice(0, 5).map((entry) => (
-                <View key={entry.rank} style={styles.lbRow}>
-                  <Text style={[styles.lbRank, entry.rank <= 3 && { color: tokens.colors.red }]}>
-                    {entry.rank}
-                  </Text>
-                  <Text style={styles.lbName} numberOfLines={1}>
-                    {entry.display_name}
-                  </Text>
-                  <Text style={styles.lbScore}>{entry.strokes}</Text>
-                </View>
-              ))}
+              {state.leaderboard.slice(0, 5).map((entry) => {
+                const isYou = state.displayName && entry.display_name === state.displayName;
+                return (
+                  <View key={entry.rank} style={[styles.lbRow, isYou && styles.lbRowYou]}>
+                    <Text style={[styles.lbRank, entry.rank <= 3 && { color: tokens.colors.red }]}>
+                      {entry.rank}
+                    </Text>
+                    <Text style={styles.lbName} numberOfLines={1}>
+                      {isYou ? 'YOU' : entry.display_name}
+                    </Text>
+                    <Text style={styles.lbScore}>{entry.strokes}</Text>
+                  </View>
+                );
+              })}
             </View>
           )}
 
@@ -896,24 +937,28 @@ export default function App() {
             </View>
           )}
 
-          <View style={styles.dotRow}>
-            {Array.from({ length: 6 }).map((_, i) => (
-              <View key={i} style={styles.decorDot} />
-            ))}
-          </View>
-          <Text style={styles.footerText}>COME BACK TOMORROW</Text>
+          <TouchableOpacity
+            activeOpacity={0.6}
+            style={styles.replayBtn}
+            onPress={() => {
+              dispatch({ type: 'REPLAY' });
+              AsyncStorage.removeItem(STORAGE_KEYS.gameState).catch(() => {});
+            }}
+          >
+            <Text style={styles.replayBtnText}>REPLAY</Text>
+          </TouchableOpacity>
         </View>
       )}
 
       {state.screen === 'error' && (
         <View style={styles.centeredContainer}>
-          <Text style={styles.titleText}>OFFLINE</Text>
+          <Text style={styles.errorTitle}>OFFLINE</Text>
           <View style={styles.dotRow}>
             {Array.from({ length: 3 }).map((_, i) => (
-              <View key={i} style={[styles.decorDot, { backgroundColor: tokens.colors.red }]} />
+              <View key={i} style={styles.decorDotRed} />
             ))}
           </View>
-          <Text style={styles.subtitleText}>{state.error}</Text>
+          <Text style={styles.errorSubtitle}>{'CONNECT TO PLAY\nTODAY\'S COURSE'}</Text>
         </View>
       )}
     </View>
@@ -925,202 +970,331 @@ export default function App() {
 // ----------------------------------------------------------------------------#
 const styles = StyleSheet.create({
   root: {
-    flex: 1,
+    width: WIDGET_SIZE,
+    height: WIDGET_SIZE,
     backgroundColor: tokens.colors.dark,
-    width: '100%',
-    height: '100%',
+    overflow: 'hidden',
   },
 
-  // Centered screens (onboarding, loading, error)
+  // Shared centered layout
   centeredContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: tokens.spacing[4],
+    paddingHorizontal: 8,
   },
-  titleText: {
-    fontFamily: 'ndot',
-    fontSize: 32,
-    lineHeight: 32,
-    color: tokens.colors.light,
-    textTransform: 'uppercase',
-    letterSpacing: 0,
-  },
-  subtitleText: {
-    ...tokens.textStyles.labelUppercasedSmall,
-    color: tokens.colors['secondary-light'],
-    marginTop: tokens.spacing[2],
-    textAlign: 'center',
-  },
+
+  // Dot rows
   dotRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: tokens.spacing[1],
-    marginVertical: tokens.spacing[2],
+    gap: 3,
+    marginVertical: 4,
   },
-  decorDot: {
-    width: 4,
-    height: 4,
-    borderRadius: tokens.borderRadius.full,
+  decorDotGray: {
+    width: 3,
+    height: 3,
+    borderRadius: 9999,
     backgroundColor: tokens.colors['secondary-dark'],
   },
-  nameInput: {
-    ...tokens.textStyles.labelUppercasedMedium,
-    color: tokens.colors.light,
-    borderBottomWidth: 1,
-    borderBottomColor: tokens.colors['secondary-dark'],
-    paddingVertical: tokens.spacing[2],
-    width: 160,
-    textAlign: 'center',
-    marginTop: tokens.spacing[3],
-  },
-  primaryBtn: {
-    marginTop: tokens.spacing[4],
-    paddingHorizontal: tokens.spacing[6],
-    paddingVertical: tokens.spacing[2],
-    borderWidth: 1,
-    borderColor: tokens.colors.light,
-    borderRadius: tokens.borderRadius.sm,
-  },
-  primaryBtnText: {
-    ...tokens.textStyles.labelUppercasedMedium,
-    color: tokens.colors.light,
+  decorDotRed: {
+    width: 3,
+    height: 3,
+    borderRadius: 9999,
+    backgroundColor: tokens.colors.red,
   },
 
-  // Game screen
-  gameContainer: {
-    flex: 1,
+  // --- Onboarding ---
+  onboardingTitle: {
+    fontFamily: 'ndot',
+    fontSize: 16,
+    lineHeight: 18,
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  onboardingSubtitle: {
+    fontFamily: 'Inter',
+    fontSize: 8,
+    fontWeight: '700',
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1.1,
+    opacity: 0.8,
+  },
+  nameInput: {
+    fontFamily: 'Inter',
+    fontSize: 9,
+    fontWeight: '500',
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 2,
+    borderBottomWidth: 1,
+    borderBottomColor: tokens.colors['secondary-dark'],
+    paddingVertical: 4,
+    width: 120,
+    textAlign: 'center',
+    marginTop: 6,
+  },
+  primaryBtn: {
+    marginTop: 8,
+    paddingHorizontal: 20,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: tokens.colors.light,
+    borderRadius: 6,
+    alignSelf: 'stretch',
+    marginHorizontal: 16,
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: tokens.spacing[4],
+  },
+  primaryBtnText: {
+    fontFamily: 'Inter',
+    fontSize: 9,
+    fontWeight: '600',
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1.5,
+  },
+
+  // --- Loading ---
+  loadingTitle: {
+    fontFamily: 'ndot',
+    fontSize: 14,
+    lineHeight: 16,
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 2,
+  },
+  loadingFooter: {
+    fontFamily: 'ndot',
+    fontSize: 8,
+    lineHeight: 10,
+    color: tokens.colors['secondary-dark'],
+    textTransform: 'uppercase',
+    marginTop: 8,
+  },
+
+  // --- Game / Playing ---
+  hudOverlay: {
+    position: 'absolute',
+    top: 5,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 20,
   },
   hud: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: tokens.spacing[2],
-    gap: tokens.spacing[4],
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 9999,
+    paddingHorizontal: 12,
+    paddingVertical: 3,
+    gap: 8,
   },
   hudItem: {
     alignItems: 'center',
   },
   hudLabel: {
-    ...tokens.textStyles.labelUppercasedSmall,
-    color: tokens.colors['secondary-light'],
+    fontFamily: 'Inter',
+    fontSize: 7,
+    fontWeight: '700',
+    color: '#a1a1aa',
+    textTransform: 'uppercase',
+    letterSpacing: -0.3,
+    opacity: 0.7,
   },
   hudValue: {
     fontFamily: 'ndot',
-    fontSize: 20,
-    lineHeight: 20,
+    fontSize: 12,
+    lineHeight: 14,
     color: tokens.colors.light,
     textTransform: 'uppercase',
   },
   hudDivider: {
     width: 1,
-    height: 20,
-    backgroundColor: tokens.colors['secondary-dark'],
+    height: 16,
+    backgroundColor: 'rgba(255,255,255,0.2)',
   },
 
-  // Results screen
+  // --- Submitting ---
+  submittingTitle: {
+    fontFamily: 'ndot',
+    fontSize: 10,
+    lineHeight: 12,
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  submittingStatus: {
+    fontFamily: 'Inter',
+    fontSize: 9,
+    fontWeight: '400',
+    color: tokens.colors['secondary-light'],
+    marginTop: 4,
+  },
+
+  // --- Results ---
   resultsContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: tokens.spacing[4],
+    paddingHorizontal: 6,
   },
-  resultsHeader: {
-    alignItems: 'center',
-    marginBottom: tokens.spacing[2],
+  resultsStrokeCount: {
+    fontFamily: 'ndot',
+    fontSize: 24,
+    lineHeight: 26,
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+  },
+  resultsStrokeLabel: {
+    fontFamily: 'Inter',
+    fontSize: 8,
+    fontWeight: '500',
+    color: tokens.colors['secondary-light'],
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    marginBottom: 4,
   },
   resultsMeta: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: tokens.spacing[3],
-    marginBottom: tokens.spacing[3],
+    gap: 6,
+    marginBottom: 4,
   },
   resultsStat: {
     alignItems: 'center',
   },
   resultStatValue: {
     fontFamily: 'ndot',
-    fontSize: 16,
-    lineHeight: 16,
+    fontSize: 9,
+    lineHeight: 10,
     color: tokens.colors.light,
     textTransform: 'uppercase',
   },
   resultStatLabel: {
-    ...tokens.textStyles.labelUppercasedSmall,
+    fontFamily: 'Inter',
+    fontSize: 7,
+    fontWeight: '500',
     color: tokens.colors['secondary-light'],
-    marginTop: 2,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginTop: 1,
   },
   resultsDivider: {
     width: 1,
-    height: 16,
+    height: 12,
     backgroundColor: tokens.colors['secondary-dark'],
+    opacity: 0.4,
   },
 
   // Leaderboard
   leaderboard: {
     width: '100%',
-    maxWidth: 240,
-    marginBottom: tokens.spacing[3],
-  },
-  lbTitle: {
-    ...tokens.textStyles.labelUppercasedSmall,
-    color: tokens.colors['secondary-light'],
-    marginBottom: tokens.spacing[1],
-    textAlign: 'center',
+    marginBottom: 3,
   },
   lbRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 3,
+    paddingVertical: 1.5,
+    paddingHorizontal: 3,
+    borderRadius: 2,
+  },
+  lbRowYou: {
+    backgroundColor: 'rgba(255,255,255,0.05)',
   },
   lbRank: {
-    ...tokens.textStyles.labelSmall,
+    fontFamily: 'Inter',
+    fontSize: 8,
+    fontWeight: '500',
     color: tokens.colors['secondary-light'],
-    width: 20,
+    width: 12,
     textAlign: 'right',
-    marginRight: tokens.spacing[2],
+    marginRight: 4,
   },
   lbName: {
-    ...tokens.textStyles.bodySmall,
+    fontFamily: 'Inter',
+    fontSize: 8,
+    fontWeight: '400',
     color: tokens.colors.light,
     flex: 1,
   },
   lbScore: {
     fontFamily: 'ndot',
-    fontSize: 14,
-    lineHeight: 14,
+    fontSize: 8,
+    lineHeight: 9,
     color: tokens.colors.light,
     textTransform: 'uppercase',
-    marginLeft: tokens.spacing[2],
+    marginLeft: 4,
   },
 
-  // Mini stats
+  // Personal stats
   statsRow: {
     flexDirection: 'row',
-    gap: tokens.spacing[4],
-    marginBottom: tokens.spacing[3],
+    gap: 10,
+    marginBottom: 3,
+    borderTopWidth: 1,
+    borderTopColor: tokens.colors['secondary-dark'],
+    paddingTop: 3,
+    width: '100%',
+    justifyContent: 'center',
   },
   miniStat: {
     alignItems: 'center',
   },
   miniStatValue: {
     fontFamily: 'ndot',
-    fontSize: 14,
-    lineHeight: 14,
+    fontSize: 8,
+    lineHeight: 9,
     color: tokens.colors.light,
     textTransform: 'uppercase',
   },
   miniStatLabel: {
-    ...tokens.textStyles.labelUppercasedSmall,
+    fontFamily: 'Inter',
+    fontSize: 7,
+    fontWeight: '500',
     color: tokens.colors['secondary-light'],
-    marginTop: 2,
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
+    marginTop: 1,
   },
 
-  footerText: {
-    ...tokens.textStyles.labelUppercasedSmall,
-    color: tokens.colors['secondary-dark'],
-    marginTop: tokens.spacing[1],
+  replayBtn: {
+    marginTop: 6,
+    paddingHorizontal: 16,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: tokens.colors.light,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  replayBtnText: {
+    fontFamily: 'Inter',
+    fontSize: 9,
+    fontWeight: '600',
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1.5,
+  },
+
+  // --- Error ---
+  errorTitle: {
+    fontFamily: 'ndot',
+    fontSize: 14,
+    lineHeight: 16,
+    color: tokens.colors.light,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  errorSubtitle: {
+    fontFamily: 'Inter',
+    fontSize: 8,
+    fontWeight: '400',
+    color: tokens.colors['secondary-light'],
+    textAlign: 'center',
+    lineHeight: 12,
   },
 });
