@@ -6,7 +6,6 @@ import { challenges, submissions, users } from "../db/schema.js";
 import type { Course } from "../db/schema.js";
 import { computePar, generateCourse } from "../lib/course-generator.js";
 import { censorName } from "../lib/profanity.js";
-import { hmacAuth } from "../lib/hmac.js";
 import { validateStrokeHistory } from "../lib/validator.js";
 import type { Env } from "./types.js";
 
@@ -52,7 +51,7 @@ challengeRouter.get("/today", async (c) => {
   });
 });
 
-challengeRouter.post("/:id/submit", hmacAuth(), async (c) => {
+challengeRouter.post("/:id/submit", async (c) => {
   const db = c.get("db");
   const challengeId = c.req.param("id");
   const body = await c.req.json();

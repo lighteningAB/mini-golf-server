@@ -17,7 +17,6 @@ import { tokens } from './src/styles/tokens';
 // ----------------------------------------------------------------------------#
 const API_BASE = 'https://mini-golf-server.vercel.app/api';
 const API_KEY = 'gk_replace_me';
-const HMAC_SECRET = '310ff372388952444c41410e88993f55aebd6dd0392c75e28501343bd68fca98';
 const HEADERS: Record<string, string> = { 'x-api-key': API_KEY, 'Content-Type': 'application/json' };
 
 const STORAGE_KEYS = {
@@ -276,37 +275,11 @@ async function fetchChallenge(): Promise<ChallengeData> {
   return res.json();
 }
 
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-async function hmacSign(body: string): Promise<{ signature: string; timestamp: string }> {
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signingString = `${timestamp}.${body}`;
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(HMAC_SECRET),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(signingString));
-  return { signature: bytesToHex(new Uint8Array(mac)), timestamp };
-}
-
 async function submitScore(challengeId: string, body: object): Promise<SubmitResult> {
   const jsonBody = JSON.stringify(body);
-  const { signature, timestamp } = await hmacSign(jsonBody);
   const res = await fetch(`${API_BASE}/challenge/${challengeId}/submit`, {
     method: 'POST',
-    headers: {
-      ...HEADERS,
-      'x-hmac-signature': signature,
-      'x-hmac-timestamp': timestamp,
-    },
+    headers: HEADERS,
     body: jsonBody,
   });
   if (!res.ok) {
